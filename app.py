@@ -1,212 +1,231 @@
 import streamlit as st
+import requests
 import pandas as pd
 import numpy as np
-import tensorflow as tf
 import joblib
-import openmeteo_requests
-from retry_requests import retry
+import tensorflow as tf
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 
-# --- CONFIGURATION & CONSTANTS ---
-STATION_LAT = 38.7167
-STATION_LON = -9.1333
-WINDOW_SIZE = 7
-NUM_FEATURES = 14
-MODEL_PATH_LSTM = 'models/weather_predictor_LSTM.keras'
-MODEL_PATH_TRANS = 'models/weather_predictor_transformer.keras'
-SCALER_FEAT_PATH = 'models/scaler_features.joblib'
-SCALER_TARG_PATH = 'models/scaler_target.joblib'
+# ----------------------------------------
+# CONFIG
+# ----------------------------------------
+LATITUDE = 38.72
+LONGITUDE = -9.14
 
-# Feature order must strictly match training
-FEATURES = [
-    'temp_max', 'temp_min', 'temp_mean', 'humidity_mean', 
-    'pressure_mean', 'precip_total', 'wind_max', 
-    'temp_max_lag_1', 'temp_max_lag_2', 'temp_max_lag_3',
-    'temp_max_mean_3d', 'temp_range', 'sin_month', 'cos_month'
-]
+FEATURE_SCALER_PATH = "scaler_features.joblib"
+TARGET_SCALER_PATH = "scaler_target.joblib"
 
-st.set_page_config(page_title="Lisbon AI Weather Predictor", layout="wide")
+LSTM_MODEL_PATH = "weather_predictor_LSTM.keras"
+TRANSFORMER_MODEL_PATH = "weather_predictor_transformer.keras"
 
-# --- CORE FUNCTIONS ---
+MAE_LSTM = 1.99
+MAE_TRANSFORMER = 2.30  # adjust if needed
 
-@st.cache_resource
-def load_ml_assets():
-    """Load pretrained models and scalers into memory."""
+
+# ----------------------------------------
+# DATA FETCHING
+# ----------------------------------------
+def fetch_data():
+    """Fetch last 10+ days of hourly weather data from Open-Meteo API"""
     try:
-        lstm = tf.keras.models.load_model(MODEL_PATH_LSTM)
-        transformer = tf.keras.models.load_model(MODEL_PATH_TRANS)
-        s_feat = joblib.load(SCALER_FEAT_PATH)
-        s_targ = joblib.load(SCALER_TARG_PATH)
-        return lstm, transformer, s_feat, s_targ
-    except Exception as e:
-        st.error(f"Erro ao carregar ficheiros ML: {e}")
-        return None, None, None, None
+        end_date = datetime.today()
+        start_date = end_date - timedelta(days=15)
 
-def fetch_weather_data(days_back=45):
-    """Fetch hourly data from Open-Meteo and resample to daily."""
-    try:
-        retry_session = retry(backoff_factor=0.2, retries=5)
-        openmeteo = openmeteo_requests.Client(session=retry_session)
-        
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days_back)
-        
+        url = "https://api.open-meteo.com/v1/forecast"
         params = {
-            "latitude": STATION_LAT,
-            "longitude": STATION_LON,
-            "start_date": str(start_date),
-            "end_date": str(end_date),
-            "hourly": ["temperature_2m", "relative_humidity_2m", "surface_pressure", "precipitation", "wind_speed_10m"],
-            "timezone": "UTC"
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "hourly": "temperature_2m,relative_humidity_2m,pressure_msl,precipitation,windspeed_10m",
+            "start_date": start_date.strftime("%Y-%m-%d"),
+            "end_date": end_date.strftime("%Y-%m-%d"),
+            "timezone": "Europe/Lisbon"
         }
-        
-        responses = openmeteo.weather_api("https://archive-api.open-meteo.com/v1/archive", params=params)
-        response = responses[0]
-        
-        hourly = response.Hourly()
-        data = {
-            "date": pd.date_range(
-                start=pd.to_datetime(hourly.Time(), unit="s"),
-                periods=len(hourly.Variables(0).ValuesAsNumpy()),
-                freq='H'
-            ),
-            "temp": hourly.Variables(0).ValuesAsNumpy(),
-            "hum": hourly.Variables(1).ValuesAsNumpy(),
-            "pres": hourly.Variables(2).ValuesAsNumpy(),
-            "prec": hourly.Variables(3).ValuesAsNumpy(),
-            "wind": hourly.Variables(4).ValuesAsNumpy()
-        }
-        
-        df_hourly = pd.DataFrame(data)
-        
-        # Resample to Daily
-        df_daily = df_hourly.resample('D', on='date').agg({
-            'temp': ['max', 'min', 'mean'],
-            'hum': 'mean',
-            'pres': 'mean',
-            'prec': 'sum',
-            'wind': 'max'
+
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+
+        df = pd.DataFrame({
+            "date": pd.to_datetime(data["hourly"]["time"]),
+            "temperature": data["hourly"]["temperature_2m"],
+            "humidity": data["hourly"]["relative_humidity_2m"],
+            "pressure": data["hourly"]["pressure_msl"],
+            "precipitation": data["hourly"]["precipitation"],
+            "wind_speed": data["hourly"]["windspeed_10m"]
         })
-        
-        df_daily.columns = ['temp_max', 'temp_min', 'temp_mean', 'humidity_mean', 'pressure_mean', 'precip_total', 'wind_max']
-        return df_daily.reset_index()
+
+        return df
+
     except Exception as e:
-        st.error(f"Erro na API Open-Meteo: {e}")
+        st.error(f"Erro ao obter dados da API: {e}")
         return None
 
-def preprocess_pipeline(df):
-    """Apply feature engineering and scaling."""
-    df = df.copy()
-    
-    # 1. Lags
-    df['temp_max_lag_1'] = df['temp_max'].shift(1)
-    df['temp_max_lag_2'] = df['temp_max'].shift(2)
-    df['temp_max_lag_3'] = df['temp_max'].shift(3)
-    
-    # 2. Rolling Mean & Range
-    df['temp_max_mean_3d'] = df['temp_max'].rolling(window=3).mean()
-    df['temp_range'] = df['temp_max'] - df['temp_min']
-    
-    # 3. Cyclical Encoding
-    df['month'] = df['date'].dt.month
-    df['sin_month'] = np.sin(2 * np.pi * df['month'] / 12)
-    df['cos_month'] = np.cos(2 * np.pi * df['month'] / 12)
-    
-    # Drop NaNs created by shifts/rolling
-    df_clean = df.dropna().reset_index(drop=True)
-    return df_clean
 
-def prepare_input_tensor(df, scaler):
-    """Extract last 7 days and reshape for LSTM/Transformer (1, 7, 14)."""
-    last_7_days = df[FEATURES].tail(WINDOW_SIZE)
-    scaled_data = scaler.transform(last_7_days)
-    return scaled_data.reshape(1, WINDOW_SIZE, NUM_FEATURES)
+# ----------------------------------------
+# PREPROCESSING
+# ----------------------------------------
+def preprocess_data(df):
+    """Convert hourly data to daily + feature engineering"""
 
-def get_prediction(model, tensor, scaler_target):
-    """Run inference and inverse scale result."""
-    pred_scaled = model.predict(tensor, verbose=0)
-    return scaler_target.inverse_transform(pred_scaled)[0][0]
+    df["date_only"] = df["date"].dt.date
 
-def plot_results(df_historic, prediction_val):
-    """Visualize last 30 days + prediction."""
-    plot_df = df_historic.tail(30).copy()
-    last_date = plot_df['date'].iloc[-1]
-    next_date = last_date + timedelta(days=1)
-    
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(plot_df['date'], plot_df['temp_max'], label='Histórico (30 dias)', color='#1f77b4', linewidth=2, marker='o', markersize=4)
-    
-    # Connect last point to prediction
-    ax.plot([last_date, next_date], [plot_df['temp_max'].iloc[-1], prediction_val], color='#d62728', linestyle='--')
-    ax.scatter(next_date, prediction_val, color='#d62728', s=100, label='Previsão Amanhã', zorder=5)
-    
-    ax.set_title("Evolução da Temperatura Máxima em Lisboa", fontsize=12)
-    ax.set_ylabel("Temperatura (°C)")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    plt.xticks(rotation=45)
-    return fig
+    df_daily = df.groupby("date_only").agg({
+        "temperature": ["max", "min", "mean"],
+        "humidity": "mean",
+        "pressure": "mean",
+        "precipitation": "sum",
+        "wind_speed": "mean"
+    })
 
-# --- UI LAYOUT ---
+    df_daily.columns = [
+        "temp_max", "temp_min", "temp_mean",
+        "humidity", "pressure", "precipitation", "wind_speed"
+    ]
 
-st.title("🌤️ Previsão de Temperatura com Deep Learning")
-st.markdown("---")
+    df_daily = df_daily.reset_index()
 
-# Load Assets
-m_lstm, m_trans, s_feat, s_targ = load_ml_assets()
+    # Feature Engineering
+    df_daily["temp_range"] = df_daily["temp_max"] - df_daily["temp_min"]
+    df_daily["temp_max_mean_3d"] = df_daily["temp_max"].rolling(window=3).mean()
 
-# Sidebar
-st.sidebar.header("🕹️ Painel de Controlo")
-model_choice = st.sidebar.radio(
-    "Selecione o Modelo:",
-    ["LSTM (Mais Estável)", "Transformer (Experimental)"]
-)
+    # Lag Features
+    for lag in range(1, 8):
+        df_daily[f"temp_max_lag_{lag}"] = df_daily["temp_max"].shift(lag)
 
-st.sidebar.markdown("### 📊 Performance Histórica")
-st.sidebar.write("**LSTM MAE:** 1.99°C")
-st.sidebar.write("**Transformer MAE:** 2.25°C")
+    df_daily = df_daily.dropna()
 
-# Main Execution
-if st.button("🚀 Gerar Previsão para Amanhã"):
-    if m_lstm and m_trans:
-        with st.spinner("A processar dados em tempo real..."):
-            # 1. Fetch
-            raw_data = fetch_weather_data()
-            if raw_data is not None:
-                # 2. Preprocess
-                processed_data = preprocess_pipeline(raw_data)
-                
-                # 3. Prepare Tensor
-                input_tensor = prepare_input_tensor(processed_data, s_feat)
-                
-                # 4. Predict with both (for confidence check)
-                res_lstm = get_prediction(m_lstm, input_tensor, s_targ)
-                res_trans = get_prediction(m_trans, input_tensor, s_targ)
-                
-                # Selection
-                final_pred = res_lstm if "LSTM" in model_choice else res_trans
-                
-                # 5. Display Results
-                st.subheader(f"Resultado: {model_choice.split(' ')[0]}")
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Previsão Amanhã", f"{final_pred:.1f} °C")
-                c2.metric("Margem de Erro", "±1.99°C")
-                
-                # Confidence Logic
-                diff = abs(res_lstm - res_trans)
-                conf_level = "Alta" if diff < 0.5 else "Moderada"
-                c3.metric("Confiança", conf_level, delta=f"Diff: {diff:.2f}°C", delta_color="inverse")
-                
-                # 6. Plot
-                st.markdown("### 📈 Visualização de Tendência")
-                fig = plot_results(processed_data, final_pred)
-                st.pyplot(fig)
-                
-                st.success("Cálculo concluído com sucesso!")
+    # Select last 7 days
+    df_model = df_daily.tail(7)
+
+    feature_cols = [
+        "temp_max", "temp_min", "temp_mean",
+        "humidity", "pressure", "precipitation", "wind_speed",
+        "temp_range", "temp_max_mean_3d",
+        "temp_max_lag_1", "temp_max_lag_2", "temp_max_lag_3",
+        "temp_max_lag_4", "temp_max_lag_5"
+    ]
+
+    X = df_model[feature_cols].values
+
+    return X, df_daily
+
+
+# ----------------------------------------
+# LOAD MODEL
+# ----------------------------------------
+def load_model(model_name):
+    if model_name == "LSTM":
+        return tf.keras.models.load_model(LSTM_MODEL_PATH)
     else:
-        st.error("Não foi possível inicializar os modelos. Verifique a pasta 'models/'.")
+        return tf.keras.models.load_model(TRANSFORMER_MODEL_PATH)
 
-st.markdown("---")
-st.caption("Projeto de Aptidão Profissional (PAP) - 12º Ano | Dados: Open-Meteo ERA5")
+
+# ----------------------------------------
+# PREDICTION
+# ----------------------------------------
+def predict(model, X, scaler_X, scaler_y):
+    """Scale, predict, inverse scale"""
+
+    X_scaled = scaler_X.transform(X)
+    X_scaled = np.reshape(X_scaled, (1, 7, 14))
+
+    pred_scaled = model.predict(X_scaled)
+    pred = scaler_y.inverse_transform(pred_scaled)
+
+    return float(pred[0][0])
+
+
+# ----------------------------------------
+# PLOT
+# ----------------------------------------
+def plot_results(df_daily, prediction):
+    """Plot last 30 days + prediction"""
+
+    df_plot = df_daily.tail(30)
+
+    dates = list(df_plot["date_only"])
+    temps = list(df_plot["temp_max"])
+
+    # Add prediction
+    next_day = dates[-1] + timedelta(days=1)
+    dates.append(next_day)
+    temps.append(prediction)
+
+    plt.figure()
+    plt.plot(dates[:-1], temps[:-1], label="Histórico")
+    plt.plot(dates[-2:], temps[-2:], linestyle="--", label="Previsão")
+
+    plt.xlabel("Data")
+    plt.ylabel("Temperatura Máx (°C)")
+    plt.title("Previsão de Temperatura")
+    plt.legend()
+
+    st.pyplot(plt)
+
+
+# ----------------------------------------
+# UI
+# ----------------------------------------
+def main():
+    st.title("🌤️ Weather Prediction App")
+    st.write("Previsão da temperatura máxima para Lisboa (Próximo Dia)")
+
+    # Sidebar
+    st.sidebar.header("Modelo")
+    model_choice = st.sidebar.radio(
+        "Seleciona o modelo:",
+        ["LSTM (Mais Estável)", "Transformer (Experimental)"]
+    )
+
+    st.sidebar.write(f"LSTM MAE: {MAE_LSTM}°C")
+    st.sidebar.write(f"Transformer MAE: {MAE_TRANSFORMER}°C")
+
+    # Load scalers
+    scaler_X = joblib.load(FEATURE_SCALER_PATH)
+    scaler_y = joblib.load(TARGET_SCALER_PATH)
+
+    # Fetch data
+    df = fetch_data()
+    if df is None:
+        return
+
+    # Preprocess
+    X, df_daily = preprocess_data(df)
+
+    # Load both models for confidence comparison
+    lstm_model = load_model("LSTM")
+    transformer_model = load_model("Transformer")
+
+    pred_lstm = predict(lstm_model, X, scaler_X, scaler_y)
+    pred_transformer = predict(transformer_model, X, scaler_X, scaler_y)
+
+    # Selected model
+    if "LSTM" in model_choice:
+        prediction = pred_lstm
+    else:
+        prediction = pred_transformer
+
+    # Display prediction
+    st.subheader("📊 Resultado")
+    st.metric("Temperatura Máxima Prevista", f"{prediction:.2f} °C")
+
+    # Confidence indicator
+    diff = abs(pred_lstm - pred_transformer)
+    if diff < 0.5:
+        confidence = "Alta"
+    else:
+        confidence = "Moderada"
+
+    st.write(f"🔍 Confiança: {confidence}")
+    st.write("Margem de erro histórica: ±1.99°C")
+
+    # Plot
+    plot_results(df_daily, prediction)
+
+
+# ----------------------------------------
+# RUN
+# ----------------------------------------
+if __name__ == "__main__":
+    main()
